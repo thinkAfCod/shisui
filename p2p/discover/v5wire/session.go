@@ -20,7 +20,6 @@ import (
 	"crypto/ecdsa"
 	crand "crypto/rand"
 	"encoding/binary"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/lru"
@@ -36,7 +35,6 @@ const handshakeTimeout = time.Second
 type SessionCache struct {
 	sessions   lru.BasicLRU[sessionID, *session]
 	handshakes map[sessionID]*Whoareyou
-	lock       sync.RWMutex
 	clock      mclock.Clock
 
 	// hooks for overriding randomness.
@@ -112,31 +110,23 @@ func (sc *SessionCache) storeNewSession(id enode.ID, addr string, s *session) {
 
 // getHandshake gets the handshake challenge we previously sent to the given remote node.
 func (sc *SessionCache) getHandshake(id enode.ID, addr string) *Whoareyou {
-	sc.lock.RLock()
-	defer sc.lock.RUnlock()
 	return sc.handshakes[sessionID{id, addr}]
 }
 
 // storeSentHandshake stores the handshake challenge sent to the given remote node.
 func (sc *SessionCache) storeSentHandshake(id enode.ID, addr string, challenge *Whoareyou) {
 	challenge.sent = sc.clock.Now()
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
 	sc.handshakes[sessionID{id, addr}] = challenge
 }
 
 // deleteHandshake deletes handshake data for the given node.
 func (sc *SessionCache) deleteHandshake(id enode.ID, addr string) {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
 	delete(sc.handshakes, sessionID{id, addr})
 }
 
 // handshakeGC deletes timed-out handshakes.
 func (sc *SessionCache) handshakeGC() {
 	deadline := sc.clock.Now().Add(-handshakeTimeout)
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
 	for key, challenge := range sc.handshakes {
 		if challenge.sent < deadline {
 			delete(sc.handshakes, key)

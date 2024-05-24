@@ -25,12 +25,9 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"runtime"
 	"slices"
 	"sync"
 	"time"
-
-	"github.com/status-im/keycard-go/hexutils"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/log"
@@ -45,7 +42,7 @@ const (
 	findnodeResultLimit     = 16 // applies in FINDNODE handler
 	totalNodesResponseLimit = 5  // applies in waitForNodes
 
-	respTimeoutV5 = 10000 * time.Millisecond
+	respTimeoutV5 = 700 * time.Millisecond
 )
 
 // codecV5 is implemented by v5wire.Codec (and testCodec).
@@ -91,9 +88,9 @@ type UDPv5 struct {
 
 	// state of dispatch
 	codec            codecV5
-	activeCallByNode sync.Map
-	activeCallByAuth sync.Map
-	callQueue        sync.Map
+	activeCallByNode map[enode.ID]*callV5
+	activeCallByAuth map[v5wire.Nonce]*callV5
+	callQueue        map[enode.ID][]*callV5
 
 	// shutdown stuff
 	closeOnce      sync.Once
@@ -161,15 +158,18 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		validSchemes: cfg.ValidSchemes,
 		clock:        cfg.Clock,
 		// channels into dispatch
-		packetInCh:    make(chan ReadPacket, runtime.NumCPU()*2),
-		readNextCh:    make(chan struct{}, runtime.NumCPU()*2),
+		packetInCh:    make(chan ReadPacket, 1),
+		readNextCh:    make(chan struct{}, 1),
 		callCh:        make(chan *callV5),
 		callDoneCh:    make(chan *callV5),
-		sendCh:        make(chan sendRequest, runtime.NumCPU()),
+		sendCh:        make(chan sendRequest),
 		respTimeoutCh: make(chan *callTimeout),
 		unhandled:     cfg.Unhandled,
 		// state of dispatch
-		codec: v5wire.NewCodec(ln, cfg.PrivateKey, cfg.Clock, cfg.V5ProtocolID),
+		codec:            v5wire.NewCodec(ln, cfg.PrivateKey, cfg.Clock, cfg.V5ProtocolID),
+		activeCallByNode: make(map[enode.ID]*callV5),
+		activeCallByAuth: make(map[v5wire.Nonce]*callV5),
+		callQueue:        make(map[enode.ID][]*callV5),
 		// shutdown
 		closeCtx:       closeCtx,
 		cancelCloseCtx: cancelCloseCtx,
@@ -319,15 +319,6 @@ func (t *UDPv5) TalkRequestToID(id enode.ID, addr *net.UDPAddr, protocol string,
 		return respMsg.(*v5wire.TalkResponse).Message, nil
 	case err := <-resp.err:
 		return nil, err
-	}
-}
-
-// TalkRequestToIDIgnoreResp sends a talk request to a Node and ignore a response.
-func (t *UDPv5) TalkRequestToIDIgnoreResp(id enode.ID, addr *net.UDPAddr, protocol string, request []byte) {
-	req := &v5wire.TalkRequest{Protocol: protocol, Message: request}
-	select {
-	case t.sendCh <- sendRequest{id, addr, req}:
-	case <-t.closeCtx.Done():
 	}
 }
 
@@ -581,66 +572,51 @@ func (t *UDPv5) dispatch() {
 	// Arm first read.
 	t.readNextCh <- struct{}{}
 
-	for i := 0; i < runtime.NumCPU()*2; i++ {
-		go func() {
-			for {
-				select {
-				case c := <-t.callCh:
-					_, ok := t.callQueue.Load(hexutils.BytesToHex(c.reqid))
-					if ok {
-						panic("BUG: call reqId is duplication")
-					}
-					t.callQueue.Store(hexutils.BytesToHex(c.reqid), c)
-					t.sendNextCall(c.reqid)
-				case ct := <-t.respTimeoutCh:
-					active, ok := t.activeCallByNode.Load(hexutils.BytesToHex(ct.c.reqid))
-					if !ok {
-						continue
-					}
+	for {
+		select {
+		case c := <-t.callCh:
+			t.callQueue[c.id] = append(t.callQueue[c.id], c)
+			t.sendNextCall(c.id)
 
-					if ct.c == active && ct.timer == active.(*callV5).timeout {
-						ct.c.err <- errTimeout
-					}
-				case c := <-t.callDoneCh:
-					active, ok := t.activeCallByNode.Load(hexutils.BytesToHex(c.reqid))
-					if !ok {
-						continue
-					}
-					if active != c {
-						panic("BUG: callDone for inactive call")
-					}
-					c.timeout.Stop()
-					t.activeCallByAuth.Delete(c.nonce)
-					t.activeCallByNode.Delete(hexutils.BytesToHex(c.reqid))
-					//t.sendNextCall(c.id)
-
-				case p, ok := <-t.packetInCh:
-					if !ok {
-						continue
-					}
-					t.handlePacket(p.Data, p.Addr)
-					// Arm next read.
-					t.readNextCh <- struct{}{}
-
-				case r := <-t.sendCh:
-					t.send(r.destID, r.destAddr, r.msg, nil)
-
-				case <-t.closeCtx.Done():
-					close(t.readNextCh)
-					t.callQueue.Range(func(id, call interface{}) bool {
-						t.callQueue.Delete(hexutils.BytesToHex(call.(*callV5).reqid))
-						return true
-					})
-					t.activeCallByAuth.Range(func(id, c interface{}) bool {
-						c.(*callV5).err <- errClosed
-						t.activeCallByNode.Delete(hexutils.BytesToHex(c.(*callV5).reqid))
-						t.activeCallByAuth.Delete(c.(*callV5).nonce)
-						return true
-					})
-					return
-				}
+		case ct := <-t.respTimeoutCh:
+			active := t.activeCallByNode[ct.c.id]
+			if ct.c == active && ct.timer == active.timeout {
+				ct.c.err <- errTimeout
 			}
-		}()
+
+		case c := <-t.callDoneCh:
+			active := t.activeCallByNode[c.id]
+			if active != c {
+				panic("BUG: callDone for inactive call")
+			}
+			c.timeout.Stop()
+			delete(t.activeCallByAuth, c.nonce)
+			delete(t.activeCallByNode, c.id)
+			t.sendNextCall(c.id)
+
+		case r := <-t.sendCh:
+			t.send(r.destID, r.destAddr, r.msg, nil)
+
+		case p := <-t.packetInCh:
+			t.handlePacket(p.Data, p.Addr)
+			// Arm next read.
+			t.readNextCh <- struct{}{}
+
+		case <-t.closeCtx.Done():
+			close(t.readNextCh)
+			for id, queue := range t.callQueue {
+				for _, c := range queue {
+					c.err <- errClosed
+				}
+				delete(t.callQueue, id)
+			}
+			for id, c := range t.activeCallByNode {
+				c.err <- errClosed
+				delete(t.activeCallByNode, id)
+				delete(t.activeCallByAuth, c.nonce)
+			}
+			return
+		}
 	}
 }
 
@@ -665,19 +641,19 @@ func (t *UDPv5) startResponseTimeout(c *callV5) {
 }
 
 // sendNextCall sends the next call in the call queue if there is no active call.
-func (t *UDPv5) sendNextCall(reqid []byte) {
-	call, ok := t.callQueue.Load(hexutils.BytesToHex(reqid))
-	if !ok {
+func (t *UDPv5) sendNextCall(id enode.ID) {
+	queue := t.callQueue[id]
+	if len(queue) == 0 || t.activeCallByNode[id] != nil {
 		return
 	}
-	_, ok = t.activeCallByNode.Load(hexutils.BytesToHex(reqid))
-	if ok {
-		return
+	t.activeCallByNode[id] = queue[0]
+	t.sendCall(t.activeCallByNode[id])
+	if len(queue) == 1 {
+		delete(t.callQueue, id)
+	} else {
+		copy(queue, queue[1:])
+		t.callQueue[id] = queue[:len(queue)-1]
 	}
-
-	t.activeCallByNode.Store(hexutils.BytesToHex(reqid), call)
-	t.sendCall(call.(*callV5))
-	t.callQueue.Delete(hexutils.BytesToHex(reqid))
 }
 
 // sendCall encodes and sends a request packet to the call's recipient node.
@@ -686,12 +662,12 @@ func (t *UDPv5) sendCall(c *callV5) {
 	// The call might have a nonce from a previous handshake attempt. Remove the entry for
 	// the old nonce because we're about to generate a new nonce for this call.
 	if c.nonce != (v5wire.Nonce{}) {
-		t.activeCallByAuth.Delete(c.nonce)
+		delete(t.activeCallByAuth, c.nonce)
 	}
-	t.log.Info("will send packet", "reqid", hexutils.BytesToHex(c.reqid))
+
 	newNonce, _ := t.send(c.id, c.addr, c.packet, c.challenge)
 	c.nonce = newNonce
-	t.activeCallByAuth.Store(c.nonce, c)
+	t.activeCallByAuth[newNonce] = c
 	t.startResponseTimeout(c)
 }
 
@@ -791,22 +767,21 @@ func (t *UDPv5) handlePacket(rawpacket []byte, fromAddr *net.UDPAddr) error {
 
 // handleCallResponse dispatches a response packet to the call waiting for it.
 func (t *UDPv5) handleCallResponse(fromID enode.ID, fromAddr *net.UDPAddr, p v5wire.Packet) bool {
-	ac, _ := t.activeCallByNode.Load(hexutils.BytesToHex(p.RequestID()))
-
-	if ac == nil || !bytes.Equal(p.RequestID(), ac.(*callV5).reqid) {
+	ac := t.activeCallByNode[fromID]
+	if ac == nil || !bytes.Equal(p.RequestID(), ac.reqid) {
 		t.log.Debug(fmt.Sprintf("Unsolicited/late %s response", p.Name()), "id", fromID, "addr", fromAddr)
 		return false
 	}
-	if !fromAddr.IP.Equal(ac.(*callV5).addr.IP) || fromAddr.Port != ac.(*callV5).addr.Port {
+	if !fromAddr.IP.Equal(ac.addr.IP) || fromAddr.Port != ac.addr.Port {
 		t.log.Debug(fmt.Sprintf("%s from wrong endpoint", p.Name()), "id", fromID, "addr", fromAddr)
 		return false
 	}
-	if p.Kind() != ac.(*callV5).responseType {
+	if p.Kind() != ac.responseType {
 		t.log.Debug(fmt.Sprintf("Wrong discv5 response type %s", p.Name()), "id", fromID, "addr", fromAddr)
 		return false
 	}
-	t.startResponseTimeout(ac.(*callV5))
-	ac.(*callV5).ch <- p
+	t.startResponseTimeout(ac)
+	ac.ch <- p
 	return true
 }
 
@@ -885,14 +860,14 @@ func (t *UDPv5) handleWhoareyou(p *v5wire.Whoareyou, fromID enode.ID, fromAddr *
 
 // matchWithCall checks whether a handshake attempt matches the active call.
 func (t *UDPv5) matchWithCall(fromID enode.ID, nonce v5wire.Nonce) (*callV5, error) {
-	c, _ := t.activeCallByAuth.Load(nonce)
+	c := t.activeCallByAuth[nonce]
 	if c == nil {
 		return nil, errChallengeNoCall
 	}
-	if c.(*callV5).handshakeCount > 0 {
+	if c.handshakeCount > 0 {
 		return nil, errChallengeTwice
 	}
-	return c.(*callV5), nil
+	return c, nil
 }
 
 // handlePing sends a PONG response.

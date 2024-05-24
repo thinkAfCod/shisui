@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"io"
 	"math/big"
 	"math/rand"
@@ -294,7 +295,8 @@ func (p *PortalProtocol) setupUDPListening() error {
 	p.packetRouter = utp.NewPacketRouter(
 		func(buf []byte, addr *net.UDPAddr) (int, error) {
 			if id, ok := p.cachedIds.Load(addr.String()); ok {
-				p.DiscV5.TalkRequestToIDIgnoreResp(id.(enode.ID), addr, string(portalwire.UTPNetwork), buf)
+				req := &v5wire.TalkRequest{Protocol: string(portalwire.UTPNetwork), Message: buf}
+				p.DiscV5.sendFromAnotherThread(id.(enode.ID), addr, req)
 				return len(buf), nil
 			} else {
 				p.Log.Warn("not found target node info", "ip", addr.IP.To4().String(), "port", addr.Port, "bufLength", len(buf))
