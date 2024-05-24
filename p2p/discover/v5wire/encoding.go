@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -150,14 +151,16 @@ type Codec struct {
 	protocolID [6]byte
 
 	// encoder buffers
-	buf      bytes.Buffer // whole packet
-	headbuf  bytes.Buffer // packet header
-	msgbuf   bytes.Buffer // message RLP plaintext
-	msgctbuf []byte       // message data ciphertext
+	buf        bytes.Buffer // whole packet
+	headbuf    bytes.Buffer // packet header
+	msgbuf     bytes.Buffer // message RLP plaintext
+	msgctbuf   []byte       // message data ciphertext
+	encodeLock sync.Mutex
 
 	// decoder buffer
-	decbuf []byte
-	reader bytes.Reader
+	decbuf     []byte
+	reader     bytes.Reader
+	decodeLock sync.Mutex
 }
 
 // NewCodec creates a wire codec.
@@ -180,6 +183,8 @@ func NewCodec(ln *enode.LocalNode, key *ecdsa.PrivateKey, clock mclock.Clock, pr
 // 'challenge' parameter should be the most recently received WHOAREYOU packet from that
 // node.
 func (c *Codec) Encode(id enode.ID, addr string, packet Packet, challenge *Whoareyou) ([]byte, Nonce, error) {
+	c.encodeLock.Lock()
+	defer c.encodeLock.Unlock()
 	// Create the packet header.
 	var (
 		head    Header
@@ -436,6 +441,8 @@ func (c *Codec) encryptMessage(s *session, p Packet, head *Header, headerData []
 
 // Decode decodes a discovery packet.
 func (c *Codec) Decode(inputData []byte, addr string) (src enode.ID, n *enode.Node, p Packet, err error) {
+	c.decodeLock.Lock()
+	defer c.decodeLock.Unlock()
 	if len(inputData) < minPacketSize {
 		return enode.ID{}, nil, nil, errTooShort
 	}

@@ -159,9 +159,8 @@ func DefaultPortalProtocolConfig() *PortalProtocolConfig {
 }
 
 type PortalProtocol struct {
-	table         *Table
-	cachedIdsLock sync.Mutex
-	cachedIds     map[string]enode.ID
+	table     *Table
+	cachedIds sync.Map
 
 	protocolId   string
 	protocolName string
@@ -201,7 +200,6 @@ func NewPortalProtocol(config *PortalProtocolConfig, protocolId string, privateK
 
 	protocolName := portalwire.NetworkNameMap[protocolId]
 	protocol := &PortalProtocol{
-		cachedIds:      make(map[string]enode.ID),
 		protocolId:     protocolId,
 		protocolName:   protocolName,
 		ListenAddr:     config.ListenAddr,
@@ -295,18 +293,8 @@ func (p *PortalProtocol) setupUDPListening() error {
 	var err error
 	p.packetRouter = utp.NewPacketRouter(
 		func(buf []byte, addr *net.UDPAddr) (int, error) {
-			p.Log.Info("will send to target data", "network", string(portalwire.UTPNetwork), "ip", addr.IP.To4().String(), "port", addr.Port, "bufLength", len(buf))
-
-			p.cachedIdsLock.Lock()
-			defer p.cachedIdsLock.Unlock()
-			if id, ok := p.cachedIds[addr.String()]; ok {
-				sendToId := id
-				go func(targetId enode.ID, addr *net.UDPAddr, utpNetwork string, buffer []byte) {
-					_, err := p.DiscV5.TalkRequestToID(targetId, addr, utpNetwork, buffer)
-					if err != nil {
-						p.Log.Error("send utp talk request failed", "err", err)
-					}
-				}(sendToId, addr, string(portalwire.UTPNetwork), buf)
+			if id, ok := p.cachedIds.Load(addr.String()); ok {
+				p.DiscV5.TalkRequestToIDIgnoreResp(id.(enode.ID), addr, string(portalwire.UTPNetwork), buf)
 				return len(buf), nil
 			} else {
 				p.Log.Warn("not found target node info", "ip", addr.IP.To4().String(), "port", addr.Port, "bufLength", len(buf))
@@ -361,19 +349,15 @@ func (p *PortalProtocol) setupDiscV5AndTable() error {
 }
 
 func (p *PortalProtocol) putCacheNodeId(node *enode.Node) {
-	p.cachedIdsLock.Lock()
-	defer p.cachedIdsLock.Unlock()
 	addr := &net.UDPAddr{IP: node.IP(), Port: node.UDP()}
-	if _, ok := p.cachedIds[addr.String()]; !ok {
-		p.cachedIds[addr.String()] = node.ID()
+	if _, ok := p.cachedIds.Load(addr.String()); !ok {
+		p.cachedIds.Store(addr.String(), node.ID())
 	}
 }
 
 func (p *PortalProtocol) putCacheId(id enode.ID, addr *net.UDPAddr) {
-	p.cachedIdsLock.Lock()
-	defer p.cachedIdsLock.Unlock()
-	if _, ok := p.cachedIds[addr.String()]; !ok {
-		p.cachedIds[addr.String()] = id
+	if _, ok := p.cachedIds.Load(addr.String()); !ok {
+		p.cachedIds.Store(addr.String(), id)
 	}
 }
 

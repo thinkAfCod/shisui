@@ -55,7 +55,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.18
 	github.com/naoina/toml v0.1.2-0.20170918210437-9fafd6967416
 	github.com/olekukonko/tablewriter v0.0.5
-	github.com/optimism-java/utp-go v0.0.0-20240520145015-212c025fd911
+	github.com/optimism-java/utp-go v0.0.0-20240524034342-ec77cca0520c
 	github.com/peterh/liner v1.1.1-0.20190123174540-a2c9a5303de7
 	github.com/protolambda/bls12-381-util v0.1.0
 	github.com/protolambda/zrnt v0.32.2
