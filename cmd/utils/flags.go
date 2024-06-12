@@ -1029,6 +1029,19 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 		Category: flags.PortalNetworkCategory,
 		Value:    cli.NewStringSlice(portalwire.HistoryNetworkName),
 	}
+
+	PortalPprofFlag = &cli.BoolFlag{
+		Name:     "pprof",
+		Usage:    "Enable the pprof HTTP server",
+		Category: flags.PortalNetworkCategory,
+		Value:    false,
+	}
+	PortalPprofPortFlag = &cli.IntFlag{
+		Name:     "pprof.port",
+		Usage:    "pprof HTTP server listening port",
+		Value:    6060,
+		Category: flags.PortalNetworkCategory,
+	}
 )
 
 var (

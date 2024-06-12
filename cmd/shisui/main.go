@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"path"
 	"slices"
 	"strings"
@@ -39,6 +40,8 @@ type Config struct {
 	DataCapacity uint64
 	LogLevel     int
 	Networks     []string
+	Pprof        bool
+	PprofPort    int
 }
 
 var app = flags.NewApp("the go-portal-network command line interface")
@@ -50,6 +53,8 @@ var (
 		utils.PortalBootNodesFlag,
 		utils.PortalPrivateKeyFlag,
 		utils.PortalNetworksFlag,
+		utils.PortalPprofFlag,
+		utils.PortalPprofPortFlag,
 	}
 	historyRpcFlags = []cli.Flag{
 		utils.PortalRPCListenAddrFlag,
@@ -102,6 +107,18 @@ func setDefaultLogger(config Config) {
 }
 
 func startPortalRpcServer(config Config, conn discover.UDPConn, addr string) error {
+	if config.Pprof {
+		addr = fmt.Sprintf("0.0.0.0:%d", config.PprofPort)
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		pprofSrv := http.Server{Addr: l.Addr().String()}
+		go func() {
+			pprofSrv.Serve(l)
+		}()
+	}
+
 	discV5, localNode, err := initDiscV5(config, conn)
 	if err != nil {
 		return err
@@ -298,6 +315,8 @@ func getPortalConfig(ctx *cli.Context) (*Config, error) {
 		}
 	}
 	config.Networks = ctx.StringSlice(utils.PortalNetworksFlag.Name)
+	config.Pprof = ctx.Bool(utils.PortalPprofFlag.Name)
+	config.PprofPort = ctx.Int(utils.PortalPprofPortFlag.Name)
 	return config, nil
 }
 
